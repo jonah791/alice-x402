@@ -70,6 +70,16 @@ record('x-payment-info.price 是 fixed/USD/十进制字符串', badPrice.length 
 record('每个付费操作都有 402 响应', missing402.length === 0, missing402.join(',') || '7/7');
 record('每个付费操作都声明 security: []（显式公开）', missingSecurity.length === 0, missingSecurity.join(',') || '7/7');
 
+// 入参 schema：审计器 L3_INPUT_SCHEMA_MISSING 的判据是 requestBody 或 parameters；
+// 官方规格明说缺 input schema 的端点会被判 strict non-invocable / skipped（上架阻断项）。
+const missingInput = paidPaths.filter(([, ops]) => Object.values(ops).some((op) => !op.requestBody && !op.parameters));
+record('每个付费操作都有入参 schema（requestBody 或 parameters）', missingInput.length === 0, missingInput.map(([p]) => p).join(',') || '7/7');
+const badBody = paidPaths.filter(([p, ops]) => Object.entries(ops).some(([, op]) =>
+  op.requestBody && !op.requestBody.content?.['application/json']?.schema?.properties));
+record('POST 入参 schema 是对象且声明 properties', badBody.length === 0, badBody.map(([p]) => p).join(',') || 'ok');
+const getParams = paths['/v1/random']?.get?.parameters;
+record('GET /v1/random 用 query parameters 声明入参', Array.isArray(getParams) && getParams.every((x) => x.in === 'query'), Array.isArray(getParams) ? `${getParams.length} 个 query 参数` : 'missing');
+
 const trialNoSecurity = trialPaths.filter(([, ops]) => Object.values(ops).some((op) => !(Array.isArray(op.security) && op.security.length === 0)));
 record('每个试用操作也声明 security: []', trialNoSecurity.length === 0, trialNoSecurity.map(([p]) => p).join(',') || '7/7');
 

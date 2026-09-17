@@ -49,22 +49,53 @@ export const CONFIG = { PRICE, NETWORK, FACILITATOR_URL, PAY_TO, trial_daily_lim
 
 const TOOL_ROUTES = [
   { path: '/hash', method: 'post', fn: TOOLS.hash, summary: 'Hash a UTF-8 string (sha1/sha256/sha384/sha512)',
+    required: ['text'],
     input: { text: 'abc', algo: 'sha256', encoding: 'hex' }, output: { algo: 'sha256', encoding: 'hex', input_bytes: 3, digest: 'ba7816bf…' } },
   { path: '/hmac', method: 'post', fn: TOOLS.hmac, summary: 'HMAC-sign a string (sha1/sha256/sha384/sha512)',
+    required: ['text', 'key'],
     input: { text: 'message', key: 'secret', algo: 'sha256', encoding: 'hex' }, output: { algo: 'hmac-sha256', encoding: 'hex', digest: 'f7bc83f4…' } },
   { path: '/encode', method: 'post', fn: TOOLS.encode, summary: 'Encode UTF-8 text to base64 / base64url / hex / url',
+    required: ['text'],
     input: { text: 'hello', to: 'base64' }, output: { to: 'base64', input_bytes: 5, result: 'aGVsbG8=' } },
   { path: '/decode', method: 'post', fn: TOOLS.decode, summary: 'Decode base64 / base64url / hex / url back to UTF-8 text',
+    required: ['text'],
     input: { text: 'aGVsbG8=', from: 'base64' }, output: { from: 'base64', result: 'hello' } },
   { path: '/jwt/decode', method: 'post', fn: TOOLS.jwtDecode, summary: 'Decode a JWT header+payload (decodes only — never verifies signatures)',
+    required: ['token'],
     input: { token: 'eyJhbGciOi…' }, output: { header: { alg: 'HS256', typ: 'JWT' }, payload: { sub: '…' }, verified: false, expired: null } },
   { path: '/random', method: 'get', fn: TOOLS.random, summary: 'Cryptographically secure random bytes / UUIDv4',
+    required: [],
     input: { bytes: 32, format: 'hex' }, output: { format: 'hex', bytes: 32, value: '9f2c…' } },
   { path: '/audit', method: 'post', fn: TOOLS.audit, price: AUDIT_PRICE,
     summary: 'Capability audit of one source file: process-execution / network-egress / filesystem-write / listening-socket / environment-read call sites with line numbers, plus an inert-vs-capability-bearing verdict',
+    required: ['text'],
     input: { text: "import { exec } from 'child_process';\nfetch('https://example.com');" },
     output: { verdict: 'capability-bearing', capabilities_found: 2, capabilities: { 'process execution': { count: 1 }, 'network egress': { count: 1 } } } },
 ];
+
+/**
+ * OpenAPI 入参 schema（审计器 L3_INPUT_SCHEMA_MISSING 的判据 = requestBody 或 parameters）。
+ * 官方规格明说：缺 input schema 的端点会被判 **strict non-invocable / skipped**——即上架阻断项。
+ * 从 r.input 的示例值派生类型，required 用显式声明（示例里的 algo/encoding 只是默认值，不该标必填）。
+ */
+function inputSchemaFor(r) {
+  const properties = Object.fromEntries(Object.keys(r.input).map((k) => [
+    k,
+    { type: typeof r.input[k] === 'number' ? 'integer' : 'string', description: `e.g. ${JSON.stringify(r.input[k]).slice(0, 60)}` },
+  ]))
+  const schema = { type: 'object', properties, required: r.required ?? [], additionalProperties: true }
+  if (r.method === 'get') {
+    return {
+      parameters: Object.keys(r.input).map((k) => ({
+        name: k,
+        in: 'query',
+        required: (r.required ?? []).includes(k),
+        schema: { type: typeof r.input[k] === 'number' ? 'integer' : 'string' },
+      })),
+    }
+  }
+  return { requestBody: { required: (r.required ?? []).length > 0, content: { 'application/json': { schema } } } }
+}
 
 function bindTools(app) {
   for (const r of TOOL_ROUTES) {
@@ -234,6 +265,7 @@ export function createApp({ withPayment = true } = {}) {
       summary: `${r.summary} — x402 ${r.price ?? PRICE} USDC per call`,
       security: [],
       responses: { 200: { description: 'result' }, 402: { description: 'payment required (x402 v2)' } },
+      ...inputSchemaFor(r),
       'x-payment-info': {
         // 形状取自审计器源码（@agentcash/discovery src/core/payment-info.ts）：
         //   PriceSchema = { mode:'fixed', currency:/^[A-Z]{3}$/, amount:string }
@@ -248,6 +280,7 @@ export function createApp({ withPayment = true } = {}) {
       summary: `${r.summary} — free trial (${TRIAL_DAILY_LIMIT}/day per IP)`,
       security: [],
       responses: { 200: { description: 'result' }, 429: { description: 'trial exhausted' } },
+      ...inputSchemaFor(r),
     })
     return c.json({
       openapi: '3.1.0',
@@ -255,7 +288,7 @@ export function createApp({ withPayment = true } = {}) {
         title: SERVICE.title,
         version: '0.1.0',
         description: SERVICE.description,
-        contact: { name: 'Alice (autonomous digital life)', url: `${origin}/` },
+        contact: { name: 'Alice (autonomous digital life)', url: `${origin}/`, email: 'alice@validator-community.com' },
         'x-guidance':
           `Pay per call over x402. An unauthenticated request to any /v1/* route returns HTTP 402 ` +
           `with the payment requirement in the "payment-required" header (x402 v2); pay in USDC on ${NETWORK} ` +
