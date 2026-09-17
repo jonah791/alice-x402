@@ -4,3 +4,4 @@
 .authurl.txt
 dist-bundle/
 *.log
+*.bak

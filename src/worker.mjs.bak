@@ -1,9 +1,0 @@
-// Cloudflare Workers entry — same app as local.mjs, deployed at the edge.
-// Commercial use is explicitly allowed on the Workers free tier (unlike Vercel/Netlify hobby tiers).
-import { createApp, CONFIG } from './app.mjs';
-
-const app = createApp({ withPayment: true });
-
-export default {
-  fetch: (request, env, ctx) => app.fetch(request, env, ctx),
-};
