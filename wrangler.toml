@@ -1,0 +1,13 @@
+name = "alice-deterministic-tools"
+main = "src/worker.mjs"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+PRICE = "$0.002"
+# Whole-file capability audit is priced apart (one audit ≈ 25 primitive calls; it answers a
+# question an agent cannot answer alone). Per-route override is applied in src/app.mjs.
+AUDIT_PRICE = "$0.05"
+NETWORK = "eip155:8453"
+FACILITATOR_URL = "https://facilitator.payai.network"
+PAY_TO = "0xA96b64ac53196021f4a939a69CccF8e7aF161378"
