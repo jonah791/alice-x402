@@ -27,6 +27,13 @@ export const SERVICE = {
 const TRIAL_DAILY_LIMIT = 25;
 const TRIAL_MAX_TEXT = 4096;
 
+// 审计器的 FAVICON_MISSING 告警用：给一个真存在的图标响应（SVG，够用且零依赖）。
+const FAVICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">' +
+  '<rect width="64" height="64" rx="12" fill="#111827"/>' +
+  '<text x="32" y="42" font-family="monospace" font-size="30" fill="#e5e7eb" text-anchor="middle">402</text>' +
+  '</svg>';
+
 const PRICE = process.env.PRICE || '$0.002';
 // Per-route override: the capability audit is a whole-file analysis, priced apart from the
 // fraction-of-a-cent primitives (one audit ≈ 25 cheap calls, and it answers a question an agent
@@ -181,42 +188,97 @@ export function createApp({ withPayment = true } = {}) {
   app.route('/v1', paid);
 
   // ---------- discovery surfaces ----------
+  // 2026-09-17 改造（依据 x402scan 官方 docs/DISCOVERY.md + 官方审计器实测输出）：
+  //   ① 发现优先级：OpenAPI(/openapi.json) > /.well-known/x402，**运行时 402 高于静态元数据**；
+  //   ② OpenAPI 每个付费操作必须有 x-payment-info（protocols + fixed price）+ responses.402 + security:[]；
+  //   ③ /.well-known/x402 的 resources 必须是**绝对 URL 字符串数组**（对象数组解析器不认；
+  //      实测审计器把 14 条路由全报 L2/L3_AUTH_MODE_MISSING + L2_NO_PAID_ROUTES）；
+  //   ④ 两种发现文档都要服务：/.well-known/x402 与 /.well-known/x402.json；
+  //   ⑤ ownershipProofs（= payTo 地址）用于归属证明。
+  const usd = (p) => String(p ?? PRICE).replace(/[^0-9.]/g, '')
+
+  const discoveryDetail = (origin) => TOOL_ROUTES.map((r) => ({
+    resource: `${origin}/v1${r.path}`,
+    method: r.method.toUpperCase(),
+    description: r.summary,
+    accepts: [{ scheme: 'exact', price: r.price ?? PRICE, network: NETWORK, payTo: PAY_TO, asset: 'USDC' }],
+  }))
+
+  const wellKnown = (origin) => ({
+    version: 1,
+    service: SERVICE,
+    // 规格形状：绝对 URL 字符串数组（x402scan 的 registerFromOrigin 只认这个）
+    resources: TOOL_ROUTES.map((r) => `${origin}/v1${r.path}`),
+    // 兼容面：富信息留给人类读者与我自己的探针，不参与规格解析
+    resources_detail: discoveryDetail(origin),
+    ownershipProofs: [PAY_TO],
+    free_trial: { base: '/trial/v1', limit_per_day: TRIAL_DAILY_LIMIT },
+  })
+
   app.get('/', (c) => c.json({
     ok: true,
     service: SERVICE,
     paid: { base: '/v1', price_per_call: PRICE, network: NETWORK, pay_to: PAY_TO, protocol: 'x402' },
     free_trial: { base: '/trial/v1', limit_per_day: TRIAL_DAILY_LIMIT },
-    tools: TOOL_ROUTES.map((r) => ({ method: r.method.toUpperCase(), path: `/v1${r.path}`, summary: r.summary })),
-    discovery: ['/.well-known/x402', '/openapi.json', '/llms.txt'],
+    tools: TOOL_ROUTES.map((r) => ({ method: r.method.toUpperCase(), path: `/v1${r.path}`, price: r.price ?? PRICE, summary: r.summary })),
+    discovery: ['/openapi.json', '/.well-known/x402', '/.well-known/x402.json', '/llms.txt'],
   }));
 
-  app.get('/.well-known/x402', (c) => c.json({
-    version: 1,
-    service: SERVICE,
-    resources: TOOL_ROUTES.map((r) => ({
-      resource: `${r.method.toUpperCase()} /v1${r.path}`,
-      description: r.summary,
-      accepts: [{ scheme: 'exact', price: r.price ?? PRICE, network: NETWORK, payTo: PAY_TO, asset: 'USDC' }],
-    })),
-    free_trial: { base: '/trial/v1', limit_per_day: TRIAL_DAILY_LIMIT },
-  }));
+  app.get('/.well-known/x402', (c) => c.json(wellKnown(new URL(c.req.url).origin)));
+  // 规格明说「两种都要给」：registerFromOrigin 先取无扩展名，只有 .json 会 noDiscovery
+  app.get('/.well-known/x402.json', (c) => c.json(wellKnown(new URL(c.req.url).origin)));
 
-  app.get('/openapi.json', (c) => c.json({
-    openapi: '3.1.0',
-    info: { title: SERVICE.title, version: '0.1.0', description: SERVICE.description },
-    servers: [{ url: '/' }],
-    paths: Object.fromEntries(TOOL_ROUTES.flatMap((r) => [
-      [`/v1${r.path}`, { [r.method]: { summary: `${r.summary} — x402 ${r.price ?? PRICE} USDC per call`, responses: { 200: { description: 'result' }, 402: { description: 'payment required' } } } }],
-      [`/trial/v1${r.path}`, { [r.method]: { summary: `${r.summary} — free trial (${TRIAL_DAILY_LIMIT}/day)`, responses: { 200: { description: 'result' }, 429: { description: 'trial exhausted' } } } }],
-    ])),
-  }));
+  app.get('/openapi.json', (c) => {
+    const origin = new URL(c.req.url).origin
+    const paidOp = (r) => ({
+      summary: `${r.summary} — x402 ${r.price ?? PRICE} USDC per call`,
+      security: [],
+      responses: { 200: { description: 'result' }, 402: { description: 'payment required (x402 v2)' } },
+      'x-payment-info': {
+        // 形状取自审计器源码（@agentcash/discovery src/core/payment-info.ts）：
+        //   PriceSchema = { mode:'fixed', currency:/^[A-Z]{3}$/, amount:string }
+        //   PaymentInfoSchema.protocols = array(**对象**)——每项形如 { x402: {...} }
+        // 实测踩坑：写成 protocols:['x402']（字符串数组）会让整块校验失败，
+        // 进而同时报 L2_PRICE_MISSING_ON_PAID + L2_PROTOCOLS_MISSING_ON_PAID。
+        price: { mode: 'fixed', currency: 'USD', amount: usd(r.price) },
+        protocols: [{ x402: { scheme: 'exact', network: NETWORK, asset: 'USDC', payTo: PAY_TO } }],
+      },
+    })
+    const trialOp = (r) => ({
+      summary: `${r.summary} — free trial (${TRIAL_DAILY_LIMIT}/day per IP)`,
+      security: [],
+      responses: { 200: { description: 'result' }, 429: { description: 'trial exhausted' } },
+    })
+    return c.json({
+      openapi: '3.1.0',
+      info: {
+        title: SERVICE.title,
+        version: '0.1.0',
+        description: SERVICE.description,
+        contact: { name: 'Alice (autonomous digital life)', url: `${origin}/` },
+        'x-guidance':
+          `Pay per call over x402. An unauthenticated request to any /v1/* route returns HTTP 402 ` +
+          `with the payment requirement in the "payment-required" header (x402 v2); pay in USDC on ${NETWORK} ` +
+          `and retry with the payment header. Free trial: ${TRIAL_DAILY_LIMIT} calls/day per IP at /trial/v1/* ` +
+          `(no key). Discovery: /openapi.json and /.well-known/x402.`,
+      },
+      servers: [{ url: `${origin}/` }],
+      paths: Object.fromEntries(TOOL_ROUTES.flatMap((r) => [
+        [`/v1${r.path}`, { [r.method]: paidOp(r) }],
+        [`/trial/v1${r.path}`, { [r.method]: trialOp(r) }],
+      ])),
+      'x-discovery': { ownershipProofs: [PAY_TO] },
+    })
+  });
+
+  app.get('/favicon.ico', (c) => c.body(FAVICON_SVG, 200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' }));
 
   app.get('/llms.txt', (c) => c.text(
     `# ${SERVICE.title}\n\n${SERVICE.description}\n\n` +
     `Free trial: POST /trial/v1/hash etc. (${TRIAL_DAILY_LIMIT} calls/day per IP, no key).\n` +
     `Paid: same tools at /v1/*, from ${PRICE} USDC per call on ${NETWORK}` +
     ` (whole-file capability audit: ${AUDIT_PRICE}), x402 protocol (HTTP 402 + payment header).\n` +
-    `Discovery: /.well-known/x402, /openapi.json.\n\nTools (price per call):\n` +
+    `Discovery: /openapi.json, /.well-known/x402, /.well-known/x402.json.\n\nTools (price per call):\n` +
     TOOL_ROUTES.map((r) => `- ${r.method.toUpperCase()} /v1${r.path} — ${r.price ?? PRICE} — ${r.summary}`).join('\n') + '\n',
   ));
 
